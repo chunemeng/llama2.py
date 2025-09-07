@@ -8,9 +8,16 @@ import torch
 import torch.nn.functional as F
 import math
 
+import triton
+
 from torch import nn
 
-from kernel.flash_attention import *
+from kernel.flash_attention import flash_attention_kernel, next_power_of_2, flash_attention_kernel_1d, is_power_of_2
+from kernel.matmul import matvec_kernel, matmul_residual_kernel
+from kernel.rmsnorm import rmsnorm_kernel_split_col, rmsnorm_kernel_split_col_one_row, rmsnorm_kernel_one_row
+from kernel.rope import rope_1d_kernel
+from kernel.swiglu import swiglu_1d_kernel
+from kernel.vec_add import vec_add_kernel
 
 
 # ----------------------------------------------------------------------------
@@ -36,24 +43,8 @@ class Config:
         if len(config_bytes) != cls.size():
             raise ValueError(f"Invalid config size: expected {cls.size()} bytes, got {len(config_bytes)} bytes")
         unpacked = struct.unpack('iiiiiii', config_bytes)
-        return cls(*unpacked[:], device='cpu')
+        return cls(*unpacked[:], device='cuda')
 
-
-class SwiGLUFFN(nn.Module):
-    def __init__(self, dim, hidden_dim, w1_data, w2_data, w3_data, device='cuda'):
-        super().__init__()
-
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-
-        with torch.no_grad():
-            self.w1.weight = w1_data
-            self.w2.weight = w2_data
-            self.w3.weight = w3_data
-
-    def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class TransformerWeights:
     def __init__(self, config: Config, device='cuda'):
@@ -62,9 +53,10 @@ class TransformerWeights:
         head_size = dim // n_heads
         kv_dim = dim * n_kv_heads // n_heads
 
+        self.dev = device
         dev = device
         # preallocate as empty tensors (will be memory-mapped later)
-        self.token_embedding_table = torch.empty(vocab_size, dim, device=dev)
+        self.token_embedding_table = None  # torch.empty(vocab_size, dim, device=dev)
         self.rms_att_weight = torch.empty(n_layers, dim, device=dev)
         self.rms_ffn_weight = torch.empty(n_layers, dim, device=dev)
         self.rms_final_weight = torch.empty(dim, device=dev)
@@ -74,11 +66,17 @@ class TransformerWeights:
         self.wv = torch.empty(n_layers, dim, kv_dim, device=dev)
         self.wo = torch.empty(n_layers, dim, dim, device=dev)
 
-        self.w1 = torch.empty(n_layers, hidden_dim, dim, device=dev)
-        self.w2 = torch.empty(n_layers, dim, hidden_dim, device=dev)
-        self.w3 = torch.empty(n_layers, hidden_dim, dim, device=dev)
+        merge_matmul_check = os.getenv('MERGE_MATMUL') == '1'
+        if merge_matmul_check:
+            self.w13 = None  # for cat(w1, w3) check only
+        else:
+            self.w1 = None  # torch.empty(n_layers, hidden_dim, dim, device=dev)
+            self.w2 = None  # torch.empty(n_layers, dim, hidden_dim, device=dev)
+            self.w3 = None  # torch.empty(n_layers, hidden_dim, dim, device=dev)
 
         self.wcls = torch.empty(vocab_size, dim, device=dev)
+        self.freq = None
+        self.scale = 1.0 / math.sqrt(head_size)
 
     def memory_map_weights(self, config: Config, data: torch.Tensor, shared_weights: int, device='cuda'):
         """
@@ -101,12 +99,13 @@ class TransformerWeights:
             n_elems = 1
             for s in shape:
                 n_elems *= s
-            t = data[ptr:ptr+n_elems]
+            t = data[ptr:ptr + n_elems]
             ptr += n_elems
             if device == 'cuda':
                 return t.view(*shape).to(device)
             else:
                 return t.view(*shape)
+
         # map weights
         self.token_embedding_table = slice_tensor((vocab_size, dim))
         self.rms_att_weight = slice_tensor((n_layers, dim))
@@ -115,9 +114,16 @@ class TransformerWeights:
         self.wv = slice_tensor((n_layers, dim, n_kv_heads * head_size))
         self.wo = slice_tensor((n_layers, n_heads * head_size, dim))
         self.rms_ffn_weight = slice_tensor((n_layers, dim))
-        self.w1 = slice_tensor((n_layers, hidden_dim, dim))
+        w1 = slice_tensor((n_layers, hidden_dim, dim))
         self.w2 = slice_tensor((n_layers, dim, hidden_dim))
-        self.w3 = slice_tensor((n_layers, hidden_dim, dim))
+        w3 = slice_tensor((n_layers, hidden_dim, dim))
+        merge_matmul_check = os.getenv('MERGE_MATMUL') == '1'
+
+        if not merge_matmul_check:
+            self.w1 = w1
+            self.w3 = w3
+        else:
+            self.w13 = torch.cat([w1, w3], dim=1)  # for checking only
         self.rms_final_weight = slice_tensor((dim,))
 
         # skip RoPE frequencies (if present in the C mmap)
@@ -129,6 +135,9 @@ class TransformerWeights:
             self.wcls = self.token_embedding_table
         else:
             self.wcls = slice_tensor((vocab_size, dim))
+
+        head_dim = torch.arange(0, dim, 2, device=self.dev) % head_size  # [0, 1, ..., head_size//2]
+        self.freq = 1.0 / (10000 ** (head_dim.float() / head_size))
 
 
 # ----------------------------------------------------------------------------
@@ -150,52 +159,286 @@ class RunState:
         self.x = torch.zeros(dim, device=dev)
         self.xb = torch.zeros(dim, device=dev)
         self.xb2 = torch.zeros(dim, device=dev)
-        self.hb = torch.zeros(hidden_dim, device=dev)
-        self.hb2 = torch.zeros(hidden_dim, device=dev)
-        qkv_device = 'cpu'
+        merge_matmul_check = os.getenv('MERGE_MATMUL') == '1'
+        if merge_matmul_check:
+            self.hbm = torch.zeros(hidden_dim * 2, device=dev)
+        else:
+            self.hb = torch.zeros(hidden_dim, device=dev)
+            self.hb2 = torch.zeros(hidden_dim, device=dev)
+        qkv_device = 'cuda'
         self.key_cache = torch.zeros(n_layers, seq_len, kv_dim, device=qkv_device)
         self.value_cache = torch.zeros(n_layers, seq_len, kv_dim, device=qkv_device)
         self.logits = torch.zeros(vocab_size, device=dev)
 
+
 time_dict = {}
+num_dict = {}
+
+
+def store_time(name, delta):
+    disable = False
+    if disable == False:
+        time_dict[name] = time_dict.get(name, 0) + delta
+        num_dict[name] = num_dict.get(name, 0) + 1
+
 
 # ----------------------------------------------------------------------------
 # neural net operations
 
-def rmsnorm(x, weight, eps=1e-5):
+def rmsnorm_triton(x, weight, out, eps=1e-5):
+    """
+    x: [dim]
+    weight: [dim]
+    return: [dim]
+    """
+    t = time_in_ms()
+    d = x.shape[0]
+    if out is None:
+        out = torch.empty_like(x)
+    grid = lambda META: (1,)
+    use_one_row = d <= 1024
+    if not use_one_row:
+        rmsnorm_kernel_split_col[grid](
+            x, weight, out,
+            d,
+            eps=eps,
+            BLOCK_COL_SIZE=512,
+            num_stages=4
+        )
+    else:
+        rmsnorm_kernel_one_row[grid](
+            x, weight, out,
+            d,
+            eps=eps,
+            BLOCK_COL_SIZE=1024,
+            num_warps=2
+        )
+
+    # rmsnorm_kernel_split_col_one_row[grid](
+    #     x, weight, out,
+    #     d,
+    #     eps=eps,
+    #     BLOCK_COL_SIZE=256,
+    #     num_stages=4
+    # )
+    # print(rmsnorm_kernel_split_col_one_row.best_config)
+    t2 = time_in_ms()
+    store_time('rmsnorm_triton', t2 - t)
+    return out
+
+
+def rmsnorm(x, weight, out=None, eps=1e-5):
+    if x.is_cuda and weight.is_cuda:
+        return rmsnorm_triton(x, weight, out, eps)
     t = time_in_ms()
     res = weight * x / torch.sqrt(torch.mean(x ** 2) + eps)
+    # assert torch.allclose(res, oo, atol=1e-6), f"rmsnorm mismatch {torch.max(torch.abs(res - oo))}"
+    if out is not None:
+        out[:] = res
     t2 = time_in_ms()
-    time_dict['rmsnorm'] = time_dict.get('rmsnorm', 0) + (t2 - t)
+    store_time('rmsnorm_cpu', t2 - t)
     return res
 
-def softmax(x):
+
+def softmax(x, dim):
     t = time_in_ms()
-    e_x = torch.exp(x - torch.max(x))
-    res = e_x / e_x.sum(dim=0)
+    res = torch.softmax(x, dim=dim)
     t2 = time_in_ms()
-    time_dict['softmax'] = time_dict.get('softmax', 0) + (t2 - t)
+    store_time('softmax_cpu', t2 - t)
     return res
 
 
-def matmul(x, w):
+def matmul_triton(x, w, output=None):
     """
     w: [d, n]
     x: [n]
     return: xout [d]
     """
     t = time_in_ms()
-    res = torch.mv(w, x)
+    if output is None:
+        output = torch.empty(w.shape[0], device=w.device, dtype=w.dtype)
+    grid = lambda META: (triton.cdiv(w.shape[0], META['BLOCK_D']),)
+    matvec_kernel[grid](x, w, output,
+                        w.shape[0], w.shape[1], BLOCK_D=128, BLOCK_N=128)
     t2 = time_in_ms()
-    time_dict['matmul'] = time_dict.get('matmul', 0) + (t2 - t)
+    store_time('matmul_triton', t2 - t)
+    return output
+
+
+def matmul(x, w, output=None):
+    """
+    w: [d, n]
+    x: [n]
+    return: xout [d]
+    """
+    if x.is_cuda and w.is_cuda:
+        return matmul_triton(x, w, output)
+    t = time_in_ms()
+    res = torch.mv(w, x, out=output)
+    t2 = time_in_ms()
+    store_time('matmul_cpu', t2 - t)
     return res
 
-def swiglu(x1, x2):
+
+def swiglu_triton(x1, x2, output=None):
+    t = time_in_ms()
+    if output is None:
+        output = torch.empty_like(x1)
+    grid = lambda META: (triton.cdiv(x1.shape[0], META['BLOCK_COL_SIZE']),)
+    swiglu_1d_kernel[grid](
+        x1, x2, output,
+        x1.shape[0],
+        BLOCK_COL_SIZE=128
+    )
+    t2 = time_in_ms()
+    store_time('swiglu_triton', t2 - t)
+    return output
+
+
+def swiglu(x1, x2, output=None):
+    if x1.is_cuda and x2.is_cuda:
+        return swiglu_triton(x1, x2, output)
     t = time_in_ms()
     res = F.silu(x1) * x2
+    if output is not None:
+        output[:] = res
+        res = output
     t2 = time_in_ms()
-    time_dict['swiglu'] = time_dict.get('swiglu', 0) + (t2 - t)
+    # assert torch.allclose(res, out, atol=1e-6), f"swiglu mismatch {torch.max(torch.abs(res - out))}"
+    store_time('swiglu_cpu', t2 - t)
     return res
+
+
+def add_triton(x, y, out=None):
+    t = time_in_ms()
+
+    if out is None:
+        out = torch.empty_like(x)
+
+    grid = lambda META: (triton.cdiv(x.shape[0], META['BLOCK_SIZE']),)
+    vec_add_kernel[grid](
+        x, y, out,
+        x.shape[0],
+        BLOCK_SIZE=128
+    )
+    t2 = time_in_ms()
+    store_time('add_triton', t2 - t)
+
+
+def add(x, y, out=None):
+    if x.is_cuda and y.is_cuda:
+        return add_triton(x, y, out)
+    t = time_in_ms()
+    if out is None:
+        out = torch.empty_like(x)
+    out[:] = x + y
+    t2 = time_in_ms()
+    store_time('add_cpu', t2 - t)
+    return out
+
+
+def matmul_residual_triton(x, w, output):
+    t = time_in_ms()
+    grid = lambda META: (triton.cdiv(w.shape[0], META['BLOCK_D']),)
+    matmul_residual_kernel[grid](x, w, output,
+                                 w.shape[0], w.shape[1], BLOCK_D=64, BLOCK_N=64, num_stages=3)
+    t2 = time_in_ms()
+    store_time('matmul_residual_triton', t2 - t)
+    return output
+
+
+def matmul_residual(x, w, output, tmp=None):
+    """
+    w: [d, n]
+    x: [n]
+    return: xout [d]
+    """
+    if x.is_cuda and w.is_cuda:
+        return matmul_residual_triton(x, w, output)
+
+    if tmp is None:
+        tmp = torch.empty_like(x)
+    t = time_in_ms()
+    matmul(x, w, output=tmp)
+    add(output, tmp, out=output)
+    t2 = time_in_ms()
+    # assert torch.allclose(oo, output, atol=1e-6), f"matmul_residual mismatch {torch.max(torch.abs(oo - output))}"
+    store_time('matmul_residual_cpu', t2 - t)
+    return output
+
+
+def rope_base(q, k, pos, dim, head_size, kv_dim=None):
+    tl = time_in_ms()
+    for i in range(0, dim, 2):
+        head_dim = i % head_size
+        freq = 1.0 / (10000 ** (float(head_dim) / head_size))
+        val = pos * freq
+        fcr = math.cos(val)
+        fci = math.sin(val)
+        rotn = 2 if i < kv_dim else 1
+        for v_idx in range(rotn):
+            vec = q if v_idx == 0 else k
+            v0, v1 = vec[i].clone(), vec[i + 1].clone()
+            vec[i] = v0 * fcr - v1 * fci
+            vec[i + 1] = v0 * fci + v1 * fcr
+    to = time_in_ms()
+    store_time('rope_base', to - tl)
+
+
+def rope_triton(q, k, freq, pos, dim):
+    tr = time_in_ms()
+    grid = lambda META: (triton.cdiv(dim // 2, META['BLOCK_SIZE']),)
+    rope_1d_kernel[grid](
+        q, k, freq, pos,
+        dim, BLOCK_SIZE=128)
+    tr2 = time_in_ms()
+    store_time('rope_triton', tr2 - tr)
+
+
+def rope_opt(q, k, pos, freq, dim, kv_dim=None):
+    tt = time_in_ms()
+    assert dim == kv_dim
+    # optimized RoPE implementation using slicing
+
+    if q.is_cuda and k.is_cuda and freq.is_cuda:
+        return rope_triton(q, k, freq, pos, dim)
+
+    val = pos * freq
+
+    fcr = torch.cos(val)
+
+    fci = torch.sin(val)
+    #
+    q_even = q[0::2]
+    k_even = k[0::2]
+    q_odd = q[1::2]
+    k_odd = k[1::2]
+    #
+    # even_idx = torch.arange(0, head_size, 2)
+    # fcr = torch.cos(val).unsqueeze(0)  # [1, head_size//2]
+    # fci = torch.sin(val).unsqueeze(0)
+
+    # q[0::2], q[::2] = q[0::2] * fcr - q[1::2] * fci, \
+    #                   q[0::2] * fci + q[1::2] * fcr
+
+    tc = time_in_ms()
+    q_new_even = q_even * fcr - q_odd * fci
+    k_new_even = k_even * fcr - k_odd * fci
+    k_new_odd = k_even * fci + k_odd * fcr
+    q_new_odd = q_even * fci + q_odd * fcr
+
+    tz = time_in_ms()
+    q[0::2] = q_new_even
+    q[1::2] = q_new_odd
+    k[0::2] = k_new_even
+    k[1::2] = k_new_odd
+    to = time_in_ms()
+    # time_dict['rope_opt_in'] = time_dict.get('rope_opt_in', 0) + (tc - tt)
+    # time_dict['rope_opt_calc'] = time_dict.get('rope_opt_calc', 0) + (tz - tc)
+    # time_dict['rope_opt_output'] = time_dict.get('rope_opt_output', 0) + (to - tz)
+    # assert torch.allclose(q, qq, atol=1e-4), f"RoPE q mismatch {torch.max(torch.abs(q - qq))}"
+    # assert torch.allclose(k, qk, atol=1e-4), f"RoPE k mismatch {torch.max(torch.abs(k - qk))}"
+    store_time('rope_opt', to - tt)
 
 
 # ----------------------------------------------------------------------------
@@ -254,6 +497,7 @@ class Transformer:
         self.data = None
 
     def forward(self, token, pos):
+        tt = time_in_ms()
         config = self.config
         transformer_weights = self.weights
         state = self.state
@@ -274,83 +518,106 @@ class Transformer:
         tc = 0
         for l in range(n_layers):
             # attention RMSNorm
-            state.xb[:] = rmsnorm(state.x, transformer_weights.rms_att_weight[l])
+            rmsnorm(state.x, transformer_weights.rms_att_weight[l], state.xb)
 
             # q, k, v
             q = matmul(state.xb, transformer_weights.wq[l])
-            # print(q.shape)
-            k = matmul(state.xb, transformer_weights.wk[l])
-            v = matmul(state.xb, transformer_weights.wv[l])
-
-            # store kv cache
-            state.key_cache[l, pos] = k
-            state.value_cache[l, pos] = v
+            k = matmul(state.xb, transformer_weights.wk[l], state.key_cache[l, pos])
+            v = matmul(state.xb, transformer_weights.wv[l], state.value_cache[l, pos])
 
             # RoPE
-            for i in range(0, dim, 2):
-                head_dim = i % head_size
-                freq = 1.0 / (10000 ** (head_dim / head_size))
-                val = pos * freq
-                fcr = math.cos(val)
-                fci = math.sin(val)
-                rotn = 2 if i < kv_dim else 1
-                for v_idx in range(rotn):
-                    vec = q if v_idx == 0 else k
-                    v0, v1 = vec[i], vec[i + 1]
-                    vec[i] = v0 * fcr - v1 * fci
-                    vec[i + 1] = v0 * fci + v1 * fcr
+            rope_opt(q, k, pos, transformer_weights.freq, dim, kv_dim)
+            # rope_base(q, k, pos, dim, head_size, kv_dim)
+            # assert torch.allclose(q, qq, atol=1e-4), f"RoPE q mismatch {torch.max(torch.abs(q - qq))}"
+            # assert torch.allclose(k, kq, atol=1e-4), f"RoPE k mismatch {torch.max(torch.abs(k - kq))}"
 
-            tt1 = time_in_ms()
+            scale = float(math.sqrt(head_size))
+
             # multihead attention
-            if state.key_cache.is_cuda:
+            if True:
                 BLOCK_D = next_power_of_2(head_size)
-                BLOCK_N = 4
-                grid = lambda META: (triton.cdiv(pos+1, META['BLOCK_N']), n_heads)
-                flash_attention_kernel[grid](q, state.key_cache[l, :pos + 1, :].unsqueeze(0),
-                                                     state.value_cache[l, :pos + 1, :].unsqueeze(0),
-                                                     state.xb.unsqueeze(0), pos + 1, dim, n_heads,
-                                                     BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, HEAD_DIM=head_size)
-            else:
-                for h in range(n_heads):
-                    lq = q[h * head_size:(h + 1) * head_size]
-                    t_z = time_in_ms()
-                    att = torch.zeros(pos + 1, device=state.key_cache.device)
-                    for t in range(pos + 1):
-                        t_z3 = time_in_ms()
-                        k_vec = state.key_cache[l, t, (h // kv_mul) * head_size:(h // kv_mul + 1) * head_size]
-                        t_z4 = time_in_ms()
-                        time_dict['attention_kvec'] = time_dict.get('attention_kvec', 0) + (t_z4 - t_z3)
-                        att[t] = torch.dot(lq, k_vec) / math.sqrt(head_size)
-                    t_z2 = time_in_ms()
-                    time_dict['attention_dot'] = time_dict.get('attention_dot', 0) + (t_z2 - t_z)
-                    att = softmax(att)
-                    xb_h = torch.zeros(head_size, device=state.key_cache.device)
-                    for t in range(pos + 1):
-                        v_vec = state.value_cache[l, t, (h // kv_mul) * head_size:(h // kv_mul + 1) * head_size]
-                        xb_h += att[t] * v_vec
-                    tb = time_in_ms()
-                    state.xb[h * head_size:(h + 1) * head_size] = xb_h.to(device=config.device)
+                BLOCK_N = 64
+                q_heads = q.view(n_heads, head_size)
+                K_heads = state.key_cache[l, :pos + 1].reshape(pos + 1, head_size)  # [L, D]
+                V_heads = state.value_cache[l, :pos + 1].reshape(pos + 1, head_size)  # [L, D]
+                grid = lambda META: (triton.cdiv(pos + 1, META['BLOCK_N']), head_size)
+                if BLOCK_D == head_size:
+                    flash_attention_kernel_1d[grid](q_heads, K_heads,
+                                                    V_heads,
+                                                    state.xb, pos + 1, dim, transformer_weights.scale,
+                                                    BLOCK_N=BLOCK_N, HEAD_DIM=head_size)
+                else:
+                    flash_attention_kernel[grid](
+                        q.view(1, n_heads, head_size),
+                        state.key_cache[l, :pos + 1].reshape(1, pos + 1, head_size),
+                        state.value_cache[l, :pos + 1].reshape(1, pos + 1, head_size),
+                        state.xb.view(1, n_heads, head_size),
+                        pos + 1, dim, n_heads,
+                        BLOCK_N=BLOCK_N,
+                        BLOCK_D=BLOCK_D,
+                        HEAD_DIM=head_size
+                    )
 
-            tt2 = time_in_ms()
-            time_dict['attention'] = time_dict.get('attention', 0) + (tt2 - tt1)
+
+
+            else:
+                if kv_mul == 1:
+                    tl = time_in_ms()
+                    q_heads = q.view(n_heads, head_size)
+                    K_heads = state.key_cache[l, :pos + 1].reshape(pos + 1, n_heads, head_size).permute(1, 0,
+                                                                                                        2)  # [H, S, D]
+                    V_heads = state.value_cache[l, :pos + 1].reshape(pos + 1, n_heads, head_size).permute(1, 0,
+                                                                                                          2)  # [H, S, D]
+                    attd = torch.bmm(K_heads, q_heads.unsqueeze(-1)).squeeze(-1) / scale
+
+                    attd = softmax(attd, dim=1)
+                    out_heads = torch.bmm(attd.unsqueeze(1), V_heads).squeeze(1)  # [H, D]
+                    state.xb[:] = out_heads.reshape(-1)
+                    to = time_in_ms()
+                    store_time('attention_bmm', to - tl)
+                else:
+                    for h in range(n_heads):
+                        lq = q[h * head_size:(h + 1) * head_size]
+                        t_z = time_in_ms()
+                        K = state.key_cache[l, :pos + 1, (h // kv_mul) * head_size:(h // kv_mul + 1) * head_size]
+                        att = (K @ lq) / scale
+                        t_z2 = time_in_ms()
+                        store_time('attention_dot', t_z2 - t_z)
+                        att = softmax(att, dim=0)
+                        V = state.value_cache[l, :pos + 1, (h // kv_mul) * head_size:(h // kv_mul + 1) * head_size]
+                        a_v = att @ V
+                        state.xb[h * head_size:(h + 1) * head_size] = a_v
+
             # attention output
-            state.xb2[:] = matmul(state.xb, transformer_weights.wo[l])
-            state.x += state.xb2
+            matmul_residual(state.xb, transformer_weights.wo[l], state.x, tmp=state.xb2)
+
+            # matmul(state.xb, transformer_weights.wo[l], output=state.xb2)
+            # add(state.x, state.xb2, out=state.x)
 
             # ffn
-            state.xb[:] = rmsnorm(state.x, transformer_weights.rms_ffn_weight[l])
-            state.hb[:] = matmul(state.xb, transformer_weights.w1[l])
-            state.hb2[:] = matmul(state.xb, transformer_weights.w3[l])
-            state.hb[:] = swiglu(state.hb, state.hb2)
-            state.xb[:] = matmul(state.hb, transformer_weights.w2[l])
-            state.x += state.xb
+            rmsnorm(state.x, transformer_weights.rms_ffn_weight[l], out=state.xb)
+            merge_matmul_check = os.getenv('MERGE_MATMUL') == '1'
+            if merge_matmul_check:
+                matmul(state.xb, transformer_weights.w13[l], output=state.hbm)
+                hb = state.hbm.narrow(0, 0, hidden_dim)
+                hb2 = state.hbm.narrow(0, hidden_dim, hidden_dim)
+            else:
+                matmul(state.xb, transformer_weights.w1[l], output=state.hb)
+                matmul(state.xb, transformer_weights.w3[l], output=state.hb2)
+                hb = state.hb
+                hb2 = state.hb2
 
+            swiglu(hb, hb2, output=hb)
+            matmul(hb, transformer_weights.w2[l], output=state.xb)
+            add(state.x, state.xb, out=state.x)
 
         # final RMSNorm
-        state.x[:] = rmsnorm(state.x, transformer_weights.rms_final_weight)
+        rmsnorm(state.x, transformer_weights.rms_final_weight, out=state.x)
         # logits
-        state.logits[:] = matmul(state.x, transformer_weights.wcls)
-        # print(f"Layer time (ms): {tc}")
+        matmul(state.x, transformer_weights.wcls, output=state.logits)
+
+        tt2 = time_in_ms()
+        store_time('forward_total', tt2 - tt)
         return state.logits
 
 
@@ -383,6 +650,7 @@ class Tokenizer:
                 self.vocab[i] = f.read(length).decode('utf-8')
 
     def decode(self, prev_token: int, token: int) -> str:
+        t = time_in_ms()
         piece = self.vocab[token]
         if prev_token == 1 and piece.startswith(' '):
             piece = piece[1:]
@@ -392,6 +660,8 @@ class Tokenizer:
             byte_val = int(piece[3:-1], 16)
             piece = self.byte_pieces[byte_val].decode('latin1')
 
+        t2 = time_in_ms()
+        store_time('token_decode', t2 - t)
         return piece
 
     def safe_print(self, piece: str):
@@ -484,9 +754,6 @@ class Tokenizer:
         return tokens
 
 
-import torch
-
-
 class ProbIndex:
     def __init__(self, prob: float, index: int):
         self.prob = prob
@@ -541,18 +808,22 @@ class Sampler:
 
         # 4. 找到截断位置
         last_idx = torch.searchsorted(cum_probs, self.topp, right=True)
-        last_idx = min(last_idx.item(), len(sorted_probs)-1)  # 防止越界
+        last_idx = min(last_idx.item(), len(sorted_probs) - 1)  # 防止越界
 
         # 5. 样本采样
         r = coin * cum_probs[last_idx]
-        pick_idx = torch.searchsorted(cum_probs[:last_idx+1], r)
+        pick_idx = torch.searchsorted(cum_probs[:last_idx + 1], r)
         return sorted_indices[pick_idx].item()
 
     # ----------------- Main Sample Function -----------------
     def sample(self, logits: torch.Tensor) -> int:
+        t = time_in_ms()
         logits = logits.clone()
         if self.temperature == 0.0:
-            return self.sample_argmax(logits)
+            t_o = time_in_ms()
+            res = self.sample_argmax(logits)
+            store_time('sample_argmax', t_o - t)
+            return res
 
         # apply temperature
         logits /= self.temperature
@@ -564,9 +835,16 @@ class Sampler:
         coin = self.random_f32()
 
         if self.topp <= 0.0 or self.topp >= 1.0:
-            return self.sample_mult(probs, coin)
+            t_o = time_in_ms()
+            res = self.sample_mult(probs, coin)
+            store_time('sample_mult', t_o - t)
+            return res
         else:
-            return self.sample_topp(probs, coin)
+            t_o = time_in_ms()
+            res = self.sample_topp(probs, coin)
+            store_time('sample_topp', t_o - t)
+            return res
+
 
 # --------------------- Utilities ---------------------
 def time_in_ms():
@@ -693,6 +971,14 @@ def chat(transformer, tokenizer, sampler, cli_user_prompt=None, cli_system_promp
             print()
 
 
+def warmup(steps=10):
+    x = torch.randn(768, device='cuda')
+    w = torch.randn(768, device='cuda')
+    o = torch.randn(768, device='cuda')
+    for _ in range(steps):
+        y = rope_opt(x, x, 0, w, 768, 768)
+
+
 # --------------------- CLI ---------------------
 def main_cli():
     import argparse
@@ -708,6 +994,7 @@ def main_cli():
     parser.add_argument("-m", type=str, default="generate", choices=["generate", "chat"])
     parser.add_argument("-y", type=str, default=None)
     args = parser.parse_args()
+    # warmup()
 
     rng_seed = args.s if args.s is not None else int(time.time())
     steps = args.n
@@ -737,5 +1024,5 @@ def main_cli():
 
 if __name__ == "__main__":
     main_cli()
-    for k, v in time_dict.items():
-        print(f"{k}: {v:.2f} ms")
+    for k, v in zip(time_dict.keys(), time_dict.values()):
+        print(f"{k}: {v:.2f} ms ({num_dict[k]} calls) avg: {v / num_dict[k]:.2f} ms")
