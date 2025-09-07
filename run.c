@@ -245,6 +245,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim*sizeof(*x));
 
+    int a = 5;
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
@@ -280,7 +281,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // multihead attention. iterate over all heads
         int h;
-        #pragma omp parallel for private(h)
+//        #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
             float* q = s->q + h * head_size;
@@ -295,6 +296,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 for (int i = 0; i < head_size; i++) {
                     score += q[i] * k[i];
                 }
+                float ahhhh = sqrtf(head_size);
                 score /= sqrtf(head_size);
                 // save the score to the attention buffer
                 att[t] = score;
