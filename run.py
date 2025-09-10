@@ -12,10 +12,11 @@ import triton
 
 from torch import nn
 
-from kernel.flash_attention import flash_attention_kernel, next_power_of_2, flash_attention_kernel_1d, is_power_of_2
-from kernel.matmul import matvec_kernel, matmul_residual_kernel
+from kernel.flash_attention import flash_attention_kernel, next_power_of_2, flash_attention_kernel_1d, is_power_of_2, \
+    flash_attention_kernel_1d_in_graph
+from kernel.matmul import matvec_kernel, matmul_residual_kernel, matvec_kernel_in_graph
 from kernel.rmsnorm import rmsnorm_kernel_split_col, rmsnorm_kernel_split_col_one_row, rmsnorm_kernel_one_row
-from kernel.rope import rope_1d_kernel
+from kernel.rope import rope_1d_kernel, rope_1d_kernel_in_graph
 from kernel.swiglu import swiglu_1d_kernel
 from kernel.vec_add import vec_add_kernel
 
@@ -76,7 +77,7 @@ class TransformerWeights:
 
         self.wcls = torch.empty(vocab_size, dim, device=dev)
         self.freq = None
-        self.scale = 1.0 / math.sqrt(head_size)
+        self.scale = math.sqrt(head_size)
 
     def memory_map_weights(self, config: Config, data: torch.Tensor, shared_weights: int, device='cuda'):
         """
@@ -154,6 +155,8 @@ class RunState:
         kv_dim = (dim * n_kv_heads) // n_heads
 
         dev = device
+
+        self.pos_tensor = torch.tensor([0], dtype=torch.int32, device='cuda')
 
         # allocate buffers, initialized to zero (like calloc)
         self.x = torch.zeros(dim, device=dev)
@@ -248,6 +251,13 @@ def softmax(x, dim):
     return res
 
 
+tune_dict = {(768, 768): (64, 128)}
+
+
+def autotune_matmul(D, N):
+    return tune_dict.get((D, N), (128, 128))
+
+
 def matmul_triton(x, w, output=None):
     """
     w: [d, n]
@@ -259,7 +269,7 @@ def matmul_triton(x, w, output=None):
         output = torch.empty(w.shape[0], device=w.device, dtype=w.dtype)
     grid = lambda META: (triton.cdiv(w.shape[0], META['BLOCK_D']),)
     matvec_kernel[grid](x, w, output,
-                        w.shape[0], w.shape[1], BLOCK_D=128, BLOCK_N=128)
+                        w.shape[0], w.shape[1])
     t2 = time_in_ms()
     store_time('matmul_triton', t2 - t)
     return output
@@ -278,6 +288,16 @@ def matmul(x, w, output=None):
     t2 = time_in_ms()
     store_time('matmul_cpu', t2 - t)
     return res
+
+
+def matmul_in_graph(x, w, o, p):
+    t = time_in_ms()
+    grid = lambda META: (triton.cdiv(w.shape[0], META['BLOCK_D']),)
+    matvec_kernel_in_graph[grid](x, w, o, p,
+                                 w.shape[0], w.shape[1])
+    t2 = time_in_ms()
+    store_time('matmul_triton', t2 - t)
+    return o
 
 
 def swiglu_triton(x1, x2, output=None):
@@ -395,6 +415,16 @@ def rope_triton(q, k, freq, pos, dim):
     store_time('rope_triton', tr2 - tr)
 
 
+def rope_triton_in_graph(q, k, freq, pos, dim):
+    tr = time_in_ms()
+    grid = lambda META: (triton.cdiv(dim // 2, META['BLOCK_SIZE']),)
+    rope_1d_kernel_in_graph[grid](
+        q, k, freq, pos,
+        dim, BLOCK_SIZE=128)
+    tr2 = time_in_ms()
+    store_time('rope_triton_in_graph', tr2 - tr)
+
+
 def rope_opt(q, k, pos, freq, dim, kv_dim=None):
     tt = time_in_ms()
     assert dim == kv_dim
@@ -453,6 +483,9 @@ class Transformer:
         self.file_size = 0
         self.mmap_obj = None
         self.data = None
+        self.cuda_graph = None
+        self._graph_constructed = False
+        self.merge_matmul_check = os.getenv('MERGE_MATMUL') == '1'
 
     def read_checkpoint(self, checkpoint_path: str):
         self.checkpoint_path = checkpoint_path
@@ -481,11 +514,17 @@ class Transformer:
             weights.memory_map_weights(config, data, shared_weights, device=config.device)
             self.weights = weights
 
+            if self.config.device == 'cuda':
+                self.mmap_obj.close()
+                self.mmap_obj = None
+
     def build_transformer(self, checkpoint_path: str):
         self.checkpoint_path = checkpoint_path
         self.read_checkpoint(checkpoint_path)
 
         self.state = RunState(self.config, device=self.config.device)
+        self.forward(0, 0)
+        self.capture_graph(144, 0)
 
     def close(self):
         if self.mmap_obj is not None:
@@ -496,7 +535,91 @@ class Transformer:
             self.fd = -1
         self.data = None
 
+    def capture_graph(self, token, pos):
+        config = self.config
+        transformer_weights = self.weights
+        state = self.state
+
+        # embedding
+        state.x[:] = transformer_weights.token_embedding_table[token]
+
+        n_layers = config.n_layers
+        dim = config.dim
+        head_size = dim // config.n_heads
+        kv_dim = dim * config.n_kv_heads // config.n_heads
+        assert self.merge_matmul_check
+
+        capture_stream = torch.cuda.Stream()
+
+        # 确保默认 stream 上的操作完成
+        torch.cuda.synchronize()
+
+        # 切换到非默认 stream
+        with torch.cuda.stream(capture_stream):
+            self.cuda_graph = torch.cuda.CUDAGraph()
+            self.cuda_graph.capture_begin()
+            for l in range(n_layers):
+                # attention RMSNorm
+                rmsnorm(state.x, transformer_weights.rms_att_weight[l], state.xb)
+
+                # q, k, v
+                q = matmul(state.xb, transformer_weights.wq[l])
+                k = matmul_in_graph(state.xb, transformer_weights.wk[l], state.key_cache[l], state.pos_tensor)
+                v = matmul_in_graph(state.xb, transformer_weights.wv[l], state.value_cache[l], state.pos_tensor)
+                #
+                # RoPE
+                rope_triton_in_graph(q, k, transformer_weights.freq, state.pos_tensor, kv_dim)
+                #
+                # multihead attention
+                BLOCK_N = 128
+                flash_attention_kernel_1d_in_graph[(config.n_heads,)](
+                    q, state.key_cache[l], state.value_cache[l],
+                    state.xb,
+                    state.pos_tensor,
+                    dim, transformer_weights.scale,
+                    BLOCK_N=BLOCK_N, HEAD_DIM=head_size
+                )
+
+                # attention output
+                matmul_residual(state.xb, transformer_weights.wo[l], state.x, tmp=state.xb2)
+
+                # ffn
+                rmsnorm(state.x, transformer_weights.rms_ffn_weight[l], out=state.xb)
+
+                matmul(state.xb, transformer_weights.w13[l], output=state.hbm)
+                hb = state.hbm[:config.hidden_dim]
+                hb2 = state.hbm[config.hidden_dim:]
+
+                swiglu(hb, hb2, output=hb)
+                matmul(hb, transformer_weights.w2[l], output=state.xb)
+                add(state.x, state.xb, out=state.x)
+
+            # final RMSNorm
+            rmsnorm(state.x, transformer_weights.rms_final_weight, out=state.x)
+            # logits
+            matmul(state.x, transformer_weights.wcls, output=state.logits)
+            self.cuda_graph.capture_end()
+
+        self._graph_constructed = True
+        return state.logits
+
+    def forward_in_graph(self, token, pos):
+        tt = time_in_ms()
+        transformer_weights = self.weights
+        state = self.state
+
+        # embedding
+        state.x[:] = transformer_weights.token_embedding_table[token]
+        state.pos_tensor[0] = pos
+
+        self.cuda_graph.replay()
+        te = time_in_ms()
+        store_time('forward_in_graph', te - tt)
+        return state.logits
+
     def forward(self, token, pos):
+        if self._graph_constructed:
+            return self.forward_in_graph(token, pos)
         tt = time_in_ms()
         config = self.config
         transformer_weights = self.weights
@@ -531,35 +654,20 @@ class Transformer:
             # assert torch.allclose(q, qq, atol=1e-4), f"RoPE q mismatch {torch.max(torch.abs(q - qq))}"
             # assert torch.allclose(k, kq, atol=1e-4), f"RoPE k mismatch {torch.max(torch.abs(k - kq))}"
 
-            scale = float(math.sqrt(head_size))
-
             # multihead attention
-            if True:
-                BLOCK_D = next_power_of_2(head_size)
-                BLOCK_N = 64
-                q_heads = q.view(n_heads, head_size)
-                K_heads = state.key_cache[l, :pos + 1].reshape(pos + 1, head_size)  # [L, D]
-                V_heads = state.value_cache[l, :pos + 1].reshape(pos + 1, head_size)  # [L, D]
-                grid = lambda META: (triton.cdiv(pos + 1, META['BLOCK_N']), head_size)
-                if BLOCK_D == head_size:
-                    flash_attention_kernel_1d[grid](q_heads, K_heads,
-                                                    V_heads,
-                                                    state.xb, pos + 1, dim, transformer_weights.scale,
-                                                    BLOCK_N=BLOCK_N, HEAD_DIM=head_size)
-                else:
-                    flash_attention_kernel[grid](
-                        q.view(1, n_heads, head_size),
-                        state.key_cache[l, :pos + 1].reshape(1, pos + 1, head_size),
-                        state.value_cache[l, :pos + 1].reshape(1, pos + 1, head_size),
-                        state.xb.view(1, n_heads, head_size),
-                        pos + 1, dim, n_heads,
-                        BLOCK_N=BLOCK_N,
-                        BLOCK_D=BLOCK_D,
-                        HEAD_DIM=head_size
-                    )
-
-
-
+            if True & is_power_of_2(head_size):
+                t1 = time_in_ms()
+                BLOCK_N = min(next_power_of_2(pos + 1), 128)
+                q_heads = q
+                K_heads = state.key_cache[l, :pos + 1]  # [L, D]
+                V_heads = state.value_cache[l, :pos + 1]  # [L, D]
+                grid = lambda META: (n_heads,)
+                flash_attention_kernel_1d[grid](q_heads, K_heads,
+                                                V_heads,
+                                                state.xb, pos + 1, dim, transformer_weights.scale,
+                                                BLOCK_N=BLOCK_N, HEAD_DIM=head_size)
+                te = time_in_ms()
+                store_time('attention_flash', te - t1)
             else:
                 if kv_mul == 1:
                     tl = time_in_ms()
@@ -568,7 +676,7 @@ class Transformer:
                                                                                                         2)  # [H, S, D]
                     V_heads = state.value_cache[l, :pos + 1].reshape(pos + 1, n_heads, head_size).permute(1, 0,
                                                                                                           2)  # [H, S, D]
-                    attd = torch.bmm(K_heads, q_heads.unsqueeze(-1)).squeeze(-1) / scale
+                    attd = torch.bmm(K_heads, q_heads.unsqueeze(-1)).squeeze(-1) / transformer_weights.scale
 
                     attd = softmax(attd, dim=1)
                     out_heads = torch.bmm(attd.unsqueeze(1), V_heads).squeeze(1)  # [H, D]
@@ -580,7 +688,7 @@ class Transformer:
                         lq = q[h * head_size:(h + 1) * head_size]
                         t_z = time_in_ms()
                         K = state.key_cache[l, :pos + 1, (h // kv_mul) * head_size:(h // kv_mul + 1) * head_size]
-                        att = (K @ lq) / scale
+                        att = (K @ lq) / transformer_weights.scale
                         t_z2 = time_in_ms()
                         store_time('attention_dot', t_z2 - t_z)
                         att = softmax(att, dim=0)
@@ -596,11 +704,10 @@ class Transformer:
 
             # ffn
             rmsnorm(state.x, transformer_weights.rms_ffn_weight[l], out=state.xb)
-            merge_matmul_check = os.getenv('MERGE_MATMUL') == '1'
-            if merge_matmul_check:
+            if self.merge_matmul_check:
                 matmul(state.xb, transformer_weights.w13[l], output=state.hbm)
-                hb = state.hbm.narrow(0, 0, hidden_dim)
-                hb2 = state.hbm.narrow(0, hidden_dim, hidden_dim)
+                hb = state.hbm[:config.hidden_dim]
+                hb2 = state.hbm[config.hidden_dim:]
             else:
                 matmul(state.xb, transformer_weights.w1[l], output=state.hb)
                 matmul(state.xb, transformer_weights.w3[l], output=state.hb2)

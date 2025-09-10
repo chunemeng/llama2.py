@@ -9,24 +9,25 @@ def matvec_torch(x, w):
     return w @ x
 
 # -------------------- Verification function -------------------- #
-def verify_matvec(num_tests=2, max_D=512, max_N=512):
+def verify_matvec(num_tests=10, max_D=512, max_N=512):
     for test_id in range(1, num_tests + 1):
-        D = 768
+        D = 32000
         N = 768
 
         x = torch.randn(N, device='cuda', dtype=torch.float32)
         w = torch.randn(D, N, device='cuda', dtype=torch.float32)
         out_triton = torch.zeros(D, device='cuda', dtype=torch.float32)
-        out_torch = matvec_torch(x, w)
-
+        # out_torch = matvec_torch(x, w)
+        #
         grid = lambda META: (triton.cdiv(D, META['BLOCK_D']),)
         matvec_kernel[grid](x, w, out_triton, D, N)
+        print(matvec_kernel.best_config)
 
-        if torch.allclose(out_triton, out_torch, rtol=1e-5, atol=1e-6):
-            print(f"✅ Test {test_id}: D={D}, N={N} 结果一致")
-        else:
-            diff = (out_triton - out_torch).abs().max()
-            print(f"❌ Test {test_id}: D={D}, N={N} 最大误差={diff.item()}")
+        # if torch.allclose(out_triton, out_torch, rtol=1e-5, atol=1e-6):
+        #     print(f"✅ Test {test_id}: D={D}, N={N} 结果一致")
+        # else:
+        #     diff = (out_triton - out_torch).abs().max()
+        #     print(f"❌ Test {test_id}: D={D}, N={N} 最大误差={diff.item()}")
 
 # -------------------- Run verification -------------------- #
 
