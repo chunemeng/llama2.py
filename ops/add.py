@@ -16,7 +16,6 @@ def add_triton(x, y, out=None):
         x, y, out,
         x.shape[0],
     )
-    # print(f'shape {x.shape}  best: {vec_add_kernel.best_config}')
     t2 = time_in_ms()
     store_time('add_triton', t2 - t)
 

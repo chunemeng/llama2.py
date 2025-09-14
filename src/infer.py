@@ -9,7 +9,6 @@ def generate(transformer, tokenizer, sampler, prompt: str, steps: int):
     if len(prompt_tokens) < 1:
         raise RuntimeError("Expected at least 1 prompt token")
 
-    pos = 0
     start_time = None
 
     token_list = prompt_tokens
@@ -17,6 +16,7 @@ def generate(transformer, tokenizer, sampler, prompt: str, steps: int):
         transformer.prefill(prompt_tokens[:-1])
 
     token = prompt_tokens[-1]
+    pos = 0
     while pos < steps:
         logits = transformer.forward(token, pos)  # logits tensor [vocab_size]
 

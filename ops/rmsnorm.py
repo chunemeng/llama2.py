@@ -4,7 +4,7 @@ from triton.language.extra.cuda import num_warps
 
 from kernel.rmsnorm import rmsnorm_kernel_split_col, rmsnorm_kernel_one_row, rmsnorm_kernel_one_row_in_graph, \
     rmsnorm_kernel_one_row_batch, rmsnorm_kernel_one_row_batch_in_graph, rmsnorm_kernel_one_row_batch_in_graph_wp, \
-    rmsnorm_kernel_split_col_one_row
+    rmsnorm_kernel_split_col_one_row, rmsnorm_kernel_one_row_batch_merge
 from ops.time_util import store_time, time_in_ms
 
 
@@ -82,26 +82,6 @@ def rmsnorm_triton(x, weight, out, eps=1e-6):
         BLOCK_COL_SIZE=triton.next_power_of_2(d),
         num_warps=2
     )
-    # cfg = rmsnorm_config(d)
-    # grid = lambda META: (triton.cdiv(d, META['BLOCK_COL_SIZE']),)
-    # rmsnorm_kernel_split_col_one_row[grid](
-    #     x, weight, out,
-    #     d,
-    #     eps=eps,
-    #     BLOCK_COL_SIZE=cfg['BLOCK_COL_SIZE'],
-    #     num_warps=cfg['num_warps'],
-    #     num_stages=cfg['num_stages']
-    # )
-    # print(f'shape {d}, use split col one row: {rmsnorm_kernel_split_col_one_row.best_config}')
-
-    # rmsnorm_kernel_split_col_one_row[grid](
-    #     x, weight, out,
-    #     d,
-    #     eps=eps,
-    #     BLOCK_COL_SIZE=256,
-    #     num_stages=4
-    # )
-    # print(rmsnorm_kernel_split_col_one_row.best_config)
     t2 = time_in_ms()
     store_time('rmsnorm_triton', t2 - t)
     return out
@@ -130,6 +110,29 @@ def rmsnorm_in_graph(x, weight, out, l, eps=1e-6):
     t2 = time_in_ms()
     store_time('rmsnorm_triton_in_graph', t2 - t)
     return out
+
+
+def rmsnorm_batch_merge(x1, weight1, out1, x2, weight2, out2, eps=1e-6):
+    # x: [B, dim]
+    # w: [dim]
+    # o: [B, dim]
+    t0 = time_in_ms()
+    grid = lambda META: (triton.cdiv(x2.shape[0], META['BATCH_SIZE']),)
+    assert x1.shape[1] == x2.shape[1]
+    assert x1.shape[0] > x2.shape[0]
+    kv_mul = x1.shape[0] // x2.shape[0]
+    rmsnorm_kernel_one_row_batch_merge[grid](
+        x1, weight1, out1, x2, weight2, out2,
+        kv_mul,
+        x2.shape[0],
+        x2.shape[1],
+        eps=eps,
+        BLOCK_COL_SIZE=triton.next_power_of_2(x2.shape[1]),
+        BATCH_SIZE=4,
+        num_warps=4
+    )
+    t2 = time_in_ms()
+    store_time('rmsnorm_triton_batch_merge', t2 - t0)
 
 
 def rmsnorm_batch(x, weight, out=None, eps=1e-6):

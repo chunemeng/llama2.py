@@ -111,6 +111,42 @@ def rmsnorm_kernel_one_row_batch_in_graph(X, W, Y, B, N, L, eps: tl.constexpr,
 
     tl.store(Y + bc, z, mask=mask)
 
+
+@triton.jit
+def rmsnorm_kernel_one_row_batch_merge(X1, W1, Y1, X2, W2, Y2, mul, B2, N, eps: tl.constexpr,
+                                       BLOCK_COL_SIZE: tl.constexpr, BATCH_SIZE: tl.constexpr, num_warps: tl.constexpr = 4):
+    pid_b = tl.program_id(0)
+    block_row = pid_b * BATCH_SIZE + tl.arange(0, BATCH_SIZE)
+    block_col = tl.arange(0, BLOCK_COL_SIZE)
+
+    mask_c = block_col < N
+    mask_b2 = block_row < B2
+    mask2 = mask_b2[:, None] & mask_c[None, :]
+    bc2 = block_row[:, None] * N + block_col[None, :]
+    x2 = tl.load(X2 + bc2, mask=mask2, other=0.0)
+    w2 = tl.load(W2 + block_col, mask=mask_c, other=0.0)
+    w1 = tl.load(W1 + block_col, mask=mask_c, other=0.0)
+
+    mask_b1 = block_row < B2 * mul
+    block_idx = tl.arange(0, 2)
+
+    bc1 = block_row[:, None, None] * N * 2 + block_idx[None, :, None] * N + block_col[None, None, :]
+    mask1 = mask_b1[:, None, None] & mask_c[None, None, :]
+
+    x1 = tl.load(X1 + bc1, mask=mask1, other=0.0)
+
+    sum_sq1 = tl.sum(x1 * x1, axis=2) / N
+    rms1 = tl.sqrt(sum_sq1 + eps)
+    z1 = x1 / rms1[:, :, None] * w1[None, None, :]
+    tl.store(Y1 + bc1, z1, mask=mask1)
+
+    sum_sq2 = tl.sum(x2 * x2, axis=1)
+    rms = tl.sqrt(sum_sq2 / N + eps)
+    z2 = x2 / rms[:, None] * w2[None, :]
+
+    tl.store(Y2 + bc2, z2, mask=mask2)
+
+
 @triton.jit
 def rmsnorm_kernel_one_row_batch(X, W, Y, B, N, eps: tl.constexpr,
                                  BLOCK_COL_SIZE: tl.constexpr, BATCH_SIZE: tl.constexpr):

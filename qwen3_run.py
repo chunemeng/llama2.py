@@ -5,8 +5,10 @@ import torch
 from kernel.flash_attention import flash_attention_kernel, next_power_of_2, flash_attention_kernel_1d, is_power_of_2, \
     flash_attention_kernel_1d_in_graph, flash_attention_kernel_1d_corner_in_graph, flash_attention_kernel_1d_corner
 from ops.add import add
-from ops.matmul import matmul_in_graph, matmul, matmul_residual_in_graph, matmul_residual
-from ops.rmsnorm import rmsnorm_in_graph, rmsnorm, rmsnorm_batch, rmsnorm_batch_in_graph
+from ops.cast import cast
+from ops.matmul import matmul_in_graph, matmul, matmul_residual_in_graph, matmul_residual, matmul_triton_float32, \
+    matmul_triton_bfloat16
+from ops.rmsnorm import rmsnorm_in_graph, rmsnorm, rmsnorm_batch, rmsnorm_batch_in_graph, rmsnorm_batch_merge
 from ops.rope import rope_triton_in_graph, rope_opt, rope_split, rope_split_in_graph
 from ops.softmax import softmax
 from ops.swiglu import swiglu
@@ -47,8 +49,8 @@ class Qwen3Transformer(Transformer):
     def build_transformer(self, checkpoint_path: str, config_path: str = None):
         super().build_transformer(checkpoint_path, config_path)
         self.forward(0, 0)
-        clear_timing()
         self.capture_graph(144, 0)
+        clear_timing()
 
     def capture_graph(self, token, pos):
         config = self.config
@@ -154,12 +156,6 @@ class Qwen3Transformer(Transformer):
         return state.logits
 
     def prefill(self, tokens):
-        for pos, token in enumerate(tokens):
-            self.forward(token, pos, is_prefill=True)
-
-    def forward(self, token, pos, is_prefill=False):
-        # if self._graph_constructed:
-        #     return self.forward_in_graph(token, pos)
         tt = time_in_ms()
         config = self.config
         transformer_weights = self.weights
@@ -177,10 +173,7 @@ class Qwen3Transformer(Transformer):
         kv_mul = n_heads // n_kv_heads
 
         # embedding
-        if config.token_table_cpu and config.device == 'cuda':
-            state.x[:] = transformer_weights.token_embedding_table[token].cuda()
-        else:
-            state.x[:] = transformer_weights.token_embedding_table[token]
+        state.x.copy_(transformer_weights.token_embedding_table[token].to(state.x.device))
 
         tc = 0
         for l in range(n_layers):
@@ -191,17 +184,14 @@ class Qwen3Transformer(Transformer):
             q = matmul(state.xb, transformer_weights.wq[l])
             k = matmul(state.xb, transformer_weights.wk[l], state.key_cache[l, pos])
             v = matmul(state.xb, transformer_weights.wv[l], state.value_cache[l, pos])
-            rmsnorm_batch(q.view((n_heads, head_size)), transformer_weights.rms_q_weight[l],
-                          out=q.view(n_heads, head_size))
-            rmsnorm_batch(k.view(n_kv_heads, head_size), transformer_weights.rms_k_weight[l],
-                          out=k.view(n_kv_heads, head_size))
+            rmsnorm_batch_merge(q.view((n_heads, head_size)), transformer_weights.rms_q_weight[l],
+                                q.view(n_heads, head_size),
+                                k.view((n_kv_heads, head_size)), transformer_weights.rms_k_weight[l],
+                                k.view(n_kv_heads, head_size))
 
             # RoPE
             # rope_opt(q, k, pos, transformer_weights.freq, dim, kv_dim)
             rope_split(q.view(n_heads, head_size), k.view(n_kv_heads, head_size), pos, transformer_weights.freq)
-
-            if is_prefill:
-                continue
 
             # multihead attention
             if config.use_fused_attention:
@@ -221,18 +211,97 @@ class Qwen3Transformer(Transformer):
             # ffn
             rmsnorm(state.x, transformer_weights.rms_ffn_weight[l], out=state.xb)
             if self.merge_matmul_check:
-                matmul(state.xb, transformer_weights.w13[l], output=state.hbm)
-                hb = state.hbm[:config.hidden_dim]
-                hb2 = state.hbm[config.hidden_dim:]
+                matmul_triton_float32(state.xb, transformer_weights.w13[l], output=state.hbm32)
+                hb = state.hbm32[:config.hidden_dim]
+                hb2 = state.hbm32[config.hidden_dim:]
             else:
                 matmul(state.xb, transformer_weights.w1[l], output=state.hb)
                 matmul(state.xb, transformer_weights.w3[l], output=state.hb2)
-                hb = state.hb
+                hb = state.hb if state.hb.dtype == torch.float32 else cast(state.hb, torch.float32)
                 hb2 = state.hb2
 
-            hbb = hb if hb.dtype == torch.float32 else hb.to(torch.float32)
-            swiglu(hbb, hb2, output=hb)
-            matmul(hb, transformer_weights.w2[l], output=state.xb)
+            swiglu(hb, hb2, output=hb)
+            matmul_triton_bfloat16(hb, transformer_weights.w2[l], output=state.xb)
+            add(state.x, state.xb, out=state.x)
+
+        # final RMSNorm
+        rmsnorm(state.x, transformer_weights.rms_final_weight, out=state.x)
+        # logits
+        matmul(state.x, transformer_weights.wcls, output=state.logits)
+
+        tt2 = time_in_ms()
+        store_time('forward_total', tt2 - tt)
+        return state.logits
+
+    def forward(self, token, pos):
+        # if self._graph_constructed:
+        #     return self.forward_in_graph(token, pos)
+        tt = time_in_ms()
+        config = self.config
+        transformer_weights = self.weights
+        state = self.state
+
+        hidden_dim = config.hidden_dim
+        n_layers = config.n_layers
+        n_heads = config.n_heads
+        n_kv_heads = config.n_kv_heads
+        seq_len = config.seq_len
+        head_size = config.head_dim
+        dim = head_size * n_heads
+
+        kv_dim = head_size * n_kv_heads
+        kv_mul = n_heads // n_kv_heads
+
+        # embedding
+        state.x.copy_(transformer_weights.token_embedding_table[token].to(state.x.device))
+
+        tc = 0
+        for l in range(n_layers):
+            # attention RMSNorm
+            rmsnorm(state.x, transformer_weights.rms_att_weight[l], state.xb)
+
+            # q, k, v
+            q = matmul(state.xb, transformer_weights.wq[l])
+            k = matmul(state.xb, transformer_weights.wk[l], state.key_cache[l, pos])
+            v = matmul(state.xb, transformer_weights.wv[l], state.value_cache[l, pos])
+            rmsnorm_batch_merge(q.view((n_heads, head_size)), transformer_weights.rms_q_weight[l],
+                                q.view(n_heads, head_size),
+                                k.view((n_kv_heads, head_size)), transformer_weights.rms_k_weight[l],
+                                k.view(n_kv_heads, head_size))
+
+            # RoPE
+            # rope_opt(q, k, pos, transformer_weights.freq, dim, kv_dim)
+            rope_split(q.view(n_heads, head_size), k.view(n_kv_heads, head_size), pos, transformer_weights.freq)
+
+            # multihead attention
+            if config.use_fused_attention:
+                flash_attention(q, state, l, pos, n_heads, head_size, kv_mul,
+                                transformer_weights)
+            else:
+                if kv_mul == 1:
+                    batch_mha(q, state, l, pos, n_heads, head_size,
+                              transformer_weights)
+                else:
+                    attention(q, state, l, pos, n_heads, head_size, kv_mul,
+                              transformer_weights)
+
+            # attention output
+            matmul_residual(state.atten_out, transformer_weights.wo[l], output=state.x, tmp=state.xb2)
+
+            # ffn
+            rmsnorm(state.x, transformer_weights.rms_ffn_weight[l], out=state.xb)
+            if self.merge_matmul_check:
+                matmul_triton_float32(state.xb, transformer_weights.w13[l], output=state.hbm32)
+                hb = state.hbm32[:config.hidden_dim]
+                hb2 = state.hbm32[config.hidden_dim:]
+            else:
+                matmul(state.xb, transformer_weights.w1[l], output=state.hb)
+                matmul(state.xb, transformer_weights.w3[l], output=state.hb2)
+                hb = state.hb if state.hb.dtype == torch.float32 else cast(state.hb, torch.float32)
+                hb2 = state.hb2
+
+            swiglu(hb, hb2, output=hb)
+            matmul_triton_bfloat16(hb, transformer_weights.w2[l], output=state.xb)
             add(state.x, state.xb, out=state.x)
 
         # final RMSNorm

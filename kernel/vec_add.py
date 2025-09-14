@@ -2,7 +2,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def vec_add_kernel(X_ptr, Y_ptr, Out_ptr, N, BLOCK_SIZE: tl.constexpr = 128, num_warps: tl.constexpr = 2):
+def vec_add_kernel(X_ptr, Y_ptr, Out_ptr, N, BLOCK_SIZE: tl.constexpr = 256, num_warps: tl.constexpr = 8):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
