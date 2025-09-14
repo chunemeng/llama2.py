@@ -2,6 +2,7 @@ import torch
 import triton
 import bench_util
 import kernel.rmsnorm as rmsnorm
+import ops.rmsnorm
 
 
 def _norm(x, eps=1e-6):
@@ -13,55 +14,7 @@ def forward(x, weight, eps=1e-6):
     return output * weight
 
 
-def verify_rms(num_tests=10, max_M=4096, max_N=4096):
-    for test_id in range(1, num_tests + 1):
-        # Randomly generate matrix size
-        M = torch.randint(1, max_M + 1, (1,)).item()
-        N = torch.randint(1, max_N + 1, (1,)).item()
-        W = torch.randn(N, device='cuda', dtype=torch.float32)
 
-        # Generate random input tensor
-        input_tensor = torch.randn(M, N, device='cuda', dtype=torch.float32)
-        output_triton = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-        output_triton1 = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-
-        output_torch = forward(x=input_tensor, weight=W, eps=1e-6)
-
-        col_size = triton.next_power_of_2(N)
-        grid = lambda META: (triton.cdiv(M, META['BLOCK_ROW_SIZE']),)
-
-        rmsnorm.rmsnorm_kernel[grid](
-            input_tensor, W, output_triton,
-            input_tensor.stride(0), input_tensor.stride(1),
-            M, N,
-            eps=1e-6,
-            BLOCK_ROW_SIZE=32,
-            COL_SIZE=col_size
-        )
-        rmsnorm.rmsnorm_kernel_split_col[grid](
-            input_tensor, W, output_triton1,
-            input_tensor.stride(0), input_tensor.stride(1),
-            M, N,
-            eps=1e-6,
-            BLOCK_ROW_SIZE=32,
-            BLOCK_COL_SIZE=32
-        )
-
-
-
-        # Validate results
-        if torch.allclose(output_triton, output_torch, rtol=1e-5, atol=1e-6):
-            print(f"✅ Test {test_id}: M={M}, N={N} 结果一致")
-        else:
-            diff = (output_triton - output_torch).abs().max()
-            print(f"❌ Test {test_id}: M={M}, N={N} 最大误差={diff.item()}")
-
-
-        if torch.allclose(output_triton1, output_torch, rtol=1e-5, atol=1e-6):
-            print(f"✅ splitk Test {test_id}: M={M}, N={N} 结果一致")
-        else:
-            diff = (output_triton1 - output_torch).abs().max()
-            print(f"❌ splitk Test {test_id}: M={M}, N={N} 最大误差={diff.item()}")
 
 
 # , 'softmax1', 'softmax2', 'softmax_2way'

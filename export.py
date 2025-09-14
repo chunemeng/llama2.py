@@ -448,6 +448,7 @@ def load_meta_model(model_path):
     model.eval()
     return model
 
+
 def hf_safetensors_to_c_mmap(safetensor_path: str, output_bin: str):
     """
     Convert a HF safetensor LLaMA model to C-style contiguous memory weights
@@ -456,13 +457,12 @@ def hf_safetensors_to_c_mmap(safetensor_path: str, output_bin: str):
 
     hf_model = AutoModelForCausalLM.from_pretrained(
         safetensor_path,
-        device_map="auto",          # 自动分配到 GPU/CPU
-        dtype=torch.float16,  # 使用半精度浮点数
-        low_cpu_mem_usage=True       # 延迟分配，节省 CPU 内存
+        device_map="auto",  # 自动分配到 GPU/CPU
+        dtype=torch.bfloat16,  # 使用半精度浮点数
+        low_cpu_mem_usage=True  # 延迟分配，节省 CPU 内存
     )
 
-
-# 1️⃣ load safetensor
+    # 1️⃣ load safetensor
     state_dict = hf_model.state_dict()
 
     # 2️⃣ infer config from HF keys
@@ -472,55 +472,72 @@ def hf_safetensors_to_c_mmap(safetensor_path: str, output_bin: str):
     # basic params
     vocab_size = state_dict['model.embed_tokens.weight'].shape[0]
     dim = state_dict['model.embed_tokens.weight'].shape[1]
-    n_layers = len([k for k in state_dict if 'self_attn.q_proj.weight' in k])
-    n_heads = state_dict['model.layers.0.self_attn.q_proj.weight'].shape[0] // dim
-    n_kv_heads = getattr(state_dict['model.layers.0.self_attn.k_proj.weight'], 'shape', [n_heads])[0] // dim
-    hidden_dim = state_dict['model.layers.0.mlp.gate_proj.weight'].shape[0]
-    head_size = dim // n_heads
+    n_layers = hf_model.config.num_hidden_layers
+    head_size = hf_model.config.head_dim
+
+    n_heads = hf_model.config.num_attention_heads
+    n_kv_heads = hf_model.config.num_key_value_heads
+    hidden_dim = hf_model.config.hidden_size
+    seq_len = 256
 
     print(f"vocab_size={vocab_size}, dim={dim}, n_layers={n_layers}, n_heads={n_heads}, hidden_dim={hidden_dim}")
 
     tensor_list = []
 
-    # --- 1. token_embedding_table
-    tensor_list.append(state_dict['model.embed_tokens.weight'].float().view(-1))
+    tensor_list.append(state_dict['model.embed_tokens.weight'].view(-1))
 
-    # --- 2. rms_att_weight (attention norm) repeat n_layers
-    tensor_list.append(state_dict['model.layers.0.input_layernorm.weight'].float().repeat(n_layers).view(-1))
+    # --- 2. attention RMSNorm (每层独立)
+    for i in range(n_layers):
+        tensor_list.append(state_dict[f'model.layers.{i}.input_layernorm.weight'].view(-1))
 
     # --- 3. QKV weights and attention output
     for i in range(n_layers):
-        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.q_proj.weight'].float().view(-1))
-        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.k_proj.weight'].float().view(-1))
-        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.v_proj.weight'].float().view(-1))
-        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.o_proj.weight'].float().view(-1))
+        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.q_proj.weight'].view(-1))
+    for i in range(n_layers):
+        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.k_proj.weight'].view(-1))
+    for i in range(n_layers):
+        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.v_proj.weight'].view(-1))
+    for i in range(n_layers):
+        tensor_list.append(state_dict[f'model.layers.{i}.self_attn.o_proj.weight'].view(-1))
+    for i in range(n_layers):
+        if f'model.layers.{i}.self_attn.q_norm.weight' in state_dict:
+            tensor_list.append(state_dict[f'model.layers.{i}.self_attn.q_norm.weight'].view(-1))
+    for i in range(n_layers):
+        if f'model.layers.{i}.self_attn.k_norm.weight' in state_dict:
+            tensor_list.append(state_dict[f'model.layers.{i}.self_attn.k_norm.weight'].view(-1))
 
-    # --- 4. RMS after FFN
-    tensor_list.append(state_dict[f'model.layers.0.post_attention_layernorm.weight'].float().repeat(n_layers).view(-1))
+    # --- 4. FFN post-attention RMSNorm (每层独立)
+    for i in range(n_layers):
+        tensor_list.append(state_dict[f'model.layers.{i}.post_attention_layernorm.weight'].view(-1))
 
     # --- 5. FFN weights
     for i in range(n_layers):
-        tensor_list.append(state_dict[f'model.layers.{i}.mlp.gate_proj.weight'].float().view(-1))
-        tensor_list.append(state_dict[f'model.layers.{i}.mlp.down_proj.weight'].float().view(-1))
-        tensor_list.append(state_dict[f'model.layers.{i}.mlp.up_proj.weight'].float().view(-1))
+        tensor_list.append(state_dict[f'model.layers.{i}.mlp.gate_proj.weight'].view(-1))
+    for i in range(n_layers):
+        tensor_list.append(state_dict[f'model.layers.{i}.mlp.down_proj.weight'].view(-1))
+    for i in range(n_layers):
+        tensor_list.append(state_dict[f'model.layers.{i}.mlp.up_proj.weight'].view(-1))
 
-    # --- 6. RMS final
-    tensor_list.append(state_dict['model.norm.weight'].float().view(-1))
+    # --- 6. final RMSNorm
+    tensor_list.append(state_dict['model.norm.weight'].view(-1))
 
     # --- 7. wcls (lm_head)
     # HF usually ties weights
     if 'lm_head.weight' in state_dict:
-        tensor_list.append(state_dict['lm_head.weight'].float().view(-1))
+        tensor_list.append(state_dict['lm_head.weight'].view(-1))
     else:
-        tensor_list.append(state_dict['model.embed_tokens.weight'].float().view(-1))
+        tensor_list.append(state_dict['model.embed_tokens.weight'].view(-1))
 
     # concat all tensors into a single 1D tensor
     all_weights = torch.cat(tensor_list)
     print("Total floats:", all_weights.numel())
+    config_values = (dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len)
 
-    # --- save to binary file
-    all_weights.numpy().astype('float32').tofile(output_bin)
-    print(f"Saved C-style weights to {output_bin}")
+    with open(output_bin, "wb") as f:  # ✅ 'wb' 二进制写入模式
+        # 写 config
+        all_weights.view(torch.uint16).cpu().numpy().tofile(output_bin)
+        print(f"Saved C-style weights to {output_bin}")
+
 
 def load_hf_to_transformer(model_path):
     """
@@ -531,9 +548,9 @@ def load_hf_to_transformer(model_path):
     # 低内存加载 HF 模型
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map="auto",          # 自动分配到 GPU/CPU
+        device_map="auto",  # 自动分配到 GPU/CPU
         dtype=torch.float16,  # 使用半精度浮点数
-        low_cpu_mem_usage=True       # 延迟分配，节省 CPU 内存
+        low_cpu_mem_usage=True  # 延迟分配，节省 CPU 内存
     )
 
     # 将 HF 配置转为自定义 Transformer 配置
@@ -585,6 +602,7 @@ def load_hf_to_transformer(model_path):
     torch.cuda.empty_cache()
 
     return model
+
 
 def load_hf_model(model_path):
     try:
@@ -718,8 +736,8 @@ if __name__ == "__main__":
         hf_safetensors_to_c_mmap(args.lf, args.filepath)
         # model = load_hf_to_transformer(args.lf)
 
-
-    if model is None:
-        parser.error("Can't load input model!")
-    # export
-    model_export(model, args.filepath, args.version, args.dtype)
+    if not args.lf:
+        if model is None:
+            parser.error("Can't load input model!")
+        # export
+        model_export(model, args.filepath, args.version, args.dtype)

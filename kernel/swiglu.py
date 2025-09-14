@@ -1,7 +1,6 @@
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def swiglu_1d_kernel(
         x_ptr,
@@ -22,5 +21,7 @@ def swiglu_1d_kernel(
     y = tl.load(y_ptr + offset, mask=mask, other=0.0)
 
     o = x * tl.sigmoid(x) * y
+
+    tl.cast(o, tl.float16)
 
     tl.store(o_ptr + offset, o, mask=mask)

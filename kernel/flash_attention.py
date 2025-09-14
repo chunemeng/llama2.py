@@ -6,17 +6,23 @@ import triton.language as tl
 
 
 @triton.jit
-def flash_attention_kernel_1d_in_graph(Q, K, V, output, pos_tensor, dim, scale, BLOCK_N: tl.constexpr,
+def flash_attention_kernel_1d_in_graph(Q, K, V, output, pos_tensor, l, dim, seq_len, kv_mul, scale,
+                                       BLOCK_N: tl.constexpr,
                                        HEAD_DIM: tl.constexpr, num_warps=4):
     pid_h = tl.program_id(0)
     N = tl.load(pos_tensor) + 1
+    kv_dim = dim // kv_mul
+
+    K = K + l * seq_len * kv_dim
+    V = V + l * seq_len * kv_dim
 
     d = (pid_h * HEAD_DIM + tl.arange(0, HEAD_DIM))
+    d_qk = ((pid_h // kv_mul) * HEAD_DIM + tl.arange(0, HEAD_DIM))
 
     block_n = tl.arange(0, BLOCK_N)
     block_q = Q + d
-    block_k = K + (block_n[:, None] * dim + d[None, :])
-    block_v = V + (block_n[:, None] * dim + d[None, :])
+    block_k = K + (block_n[:, None] * kv_dim + d_qk[None, :])
+    block_v = V + (block_n[:, None] * kv_dim + d_qk[None, :])
 
     q_tile = tl.load(block_q) / scale
 
@@ -28,6 +34,59 @@ def flash_attention_kernel_1d_in_graph(Q, K, V, output, pos_tensor, dim, scale, 
         mask = (block_n + n < N)
         k_tile = tl.load(block_k, mask=mask[:, None], other=0.0)
         v_tile = tl.load(block_v, mask=mask[:, None], other=0.0)
+        x = tl.sum(k_tile * q_tile, axis=1, dtype=tl.float32)
+
+        x_max_masked = tl.where(mask, x, float('-inf'))
+
+        x_max = tl.max(x_max_masked)
+
+        maxs = tl.maximum(m, x_max)
+
+        diff_exp = tl.exp(m - maxs)
+
+        x_diff_exp_masked = tl.where(mask, tl.exp(x - maxs), 0.0)
+        d_n = de * diff_exp + tl.sum(x_diff_exp_masked, dtype=tl.float32)
+
+        o_t = tl.sum(v_tile * x_diff_exp_masked[:, None], axis=0)
+
+        o = o_t + o * diff_exp
+        m = maxs
+        de = d_n
+        block_k += BLOCK_N * kv_dim
+        block_v += BLOCK_N * kv_dim
+
+    o /= de
+    tl.store(output + d, o)
+
+
+@triton.jit
+def flash_attention_kernel_1d_corner_in_graph(Q, K, V, output, pos_tensor, l, head_dim, dim, seq_len, scale,
+                                              BLOCK_N: tl.constexpr,
+                                              HEAD_DIM: tl.constexpr, num_warps=4):
+    pid_h = tl.program_id(0)
+    N = tl.load(pos_tensor) + 1
+
+    K = K + l * seq_len * dim
+    V = V + l * seq_len * dim
+
+    d = (pid_h * head_dim + tl.arange(0, HEAD_DIM))
+    maskd = d < dim
+
+    block_n = tl.arange(0, BLOCK_N)
+    block_q = Q + d
+    block_k = K + (block_n[:, None] * dim + d[None, :])
+    block_v = V + (block_n[:, None] * dim + d[None, :])
+
+    q_tile = tl.load(block_q, mask=maskd, other=0.0) / scale
+
+    m = -float('inf')
+    de = 0.0
+    o = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    for n in tl.range(0, N, BLOCK_N):
+        mask = (block_n + n < N)
+        k_tile = tl.load(block_k, mask=mask[:, None] & maskd[None, :], other=0.0)
+        v_tile = tl.load(block_v, mask=mask[:, None] & maskd[None, :], other=0.0)
         x = tl.sum(k_tile * q_tile, axis=1)
 
         x_max_masked = tl.where(mask, x, float('-inf'))
@@ -53,20 +112,69 @@ def flash_attention_kernel_1d_in_graph(Q, K, V, output, pos_tensor, dim, scale, 
     tl.store(output + d, o)
 
 
+@triton.jit
+def flash_attention_kernel_1d(Q, K, V, output, N, dim, kv_mul, scale, BLOCK_N: tl.constexpr,
+                              HEAD_DIM: tl.constexpr, num_stages: tl.constexpr = 3):
+    pid_h = tl.program_id(0)
+    kv_dim = dim // kv_mul
+
+    d = (pid_h * HEAD_DIM + tl.arange(0, HEAD_DIM))
+    d_qk = ((pid_h // kv_mul) * HEAD_DIM + tl.arange(0, HEAD_DIM))
+
+    block_n = tl.arange(0, BLOCK_N)
+    block_q = Q + d
+    block_k = K + (block_n[:, None] * kv_dim + d_qk[None, :])
+    block_v = V + (block_n[:, None] * kv_dim + d_qk[None, :])
+
+    q_tile = tl.load(block_q) / scale
+
+    m = -float('inf')
+    de = 0.0
+    o = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    for n in tl.range(0, N, BLOCK_N, num_stages=num_stages):
+        mask = (block_n + n < N)
+        k_tile = tl.load(block_k, mask=mask[:, None], other=0.0)
+        v_tile = tl.load(block_v, mask=mask[:, None], other=0.0)
+        x = tl.sum(k_tile * q_tile, axis=1)
+
+        x_max_masked = tl.where(mask, x, float('-inf'))
+
+        x_max = tl.max(x_max_masked)
+
+        maxs = tl.maximum(m, x_max)
+
+        diff_exp = tl.exp(m - maxs)
+
+        x_diff_exp_masked = tl.where(mask, tl.exp(x - maxs), 0.0)
+        d_n = de * diff_exp + tl.sum(x_diff_exp_masked, dtype=tl.float32)
+
+        o_t = tl.sum(v_tile * x_diff_exp_masked[:, None], axis=0)
+
+        o = o_t + o * diff_exp
+        m = maxs
+        de = d_n
+        block_k += BLOCK_N * kv_dim
+        block_v += BLOCK_N * kv_dim
+
+    o /= de
+    tl.store(output + d, o)
+
 
 @triton.jit
-def flash_attention_kernel_1d(Q, K, V, output, N, dim, scale, BLOCK_N: tl.constexpr,
-                              HEAD_DIM: tl.constexpr, num_warps=4):
+def flash_attention_kernel_1d_corner(Q, K, V, output, N, dim, head_dim, scale, BLOCK_N: tl.constexpr,
+                                     HEAD_DIM: tl.constexpr, num_warps=4):
     pid_h = tl.program_id(0)
 
-    d = (pid_h * HEAD_DIM + tl.arange(0, HEAD_DIM))
+    d = (pid_h * head_dim + tl.arange(0, HEAD_DIM))
+    maskd = d < dim
 
     block_n = tl.arange(0, BLOCK_N)
     block_q = Q + d
     block_k = K + (block_n[:, None] * dim + d[None, :])
     block_v = V + (block_n[:, None] * dim + d[None, :])
 
-    q_tile = tl.load(block_q) / scale
+    q_tile = tl.load(block_q, mask=maskd, other=0.0) / scale
 
     m = -float('inf')
     de = 0.0
@@ -74,8 +182,8 @@ def flash_attention_kernel_1d(Q, K, V, output, N, dim, scale, BLOCK_N: tl.conste
 
     for n in tl.range(0, N, BLOCK_N):
         mask = (block_n + n < N)
-        k_tile = tl.load(block_k, mask=mask[:, None], other=0.0)
-        v_tile = tl.load(block_v, mask=mask[:, None], other=0.0)
+        k_tile = tl.load(block_k, mask=mask[:, None] & maskd[None, :], other=0.0)
+        v_tile = tl.load(block_v, mask=mask[:, None] & maskd[None, :], other=0.0)
         x = tl.sum(k_tile * q_tile, axis=1)
 
         x_max_masked = tl.where(mask, x, float('-inf'))
@@ -98,68 +206,7 @@ def flash_attention_kernel_1d(Q, K, V, output, N, dim, scale, BLOCK_N: tl.conste
         block_v += BLOCK_N * dim
 
     o /= de
-    tl.store(output + d, o)
-
-
-@triton.jit
-def flash_attention_kernel_1d_corner(Q, K, V, output, N, h_dim, scale, BLOCK_N: tl.constexpr,
-                                     BLOCK_D: tl.constexpr, HEAD_DIM: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_h = tl.program_id(1)
-
-    n_ptr = (pid_m * BLOCK_N + tl.arange(0, BLOCK_N))
-
-    mask_d = tl.arange(0, BLOCK_D) < HEAD_DIM
-    d = (pid_h * HEAD_DIM + tl.arange(0, BLOCK_D))
-
-    block_n = tl.arange(0, BLOCK_N)
-    block_q = Q + d
-    block_k = K + (block_n[:, None] * h_dim + d[None, :])
-    block_v = V + (block_n[:, None] * h_dim + d[None, :])
-
-    q_tile = tl.load(block_q, mask=mask_d, other=0.0)
-
-    m = tl.zeros((BLOCK_N,), dtype=tl.float32) - float('inf')
-    de = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    o = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
-    for n in range(0, N, BLOCK_N):
-        mask = (mask_d[None, :]) & (block_n[:, None] + n < N)
-        k_tile = tl.load(block_k, mask=mask, other=0.0)
-        v_tile = tl.load(block_v, mask=mask, other=0.0)
-        x = tl.sum(q_tile * k_tile, axis=2)
-
-        mask = (n_ptr[:, None] < N) & (block_n[None, :] + n < N)
-        x_max_masked = tl.where(mask, x, float('-inf'))
-
-        x_max = tl.max(x_max_masked, axis=0)
-
-        maxs = tl.maximum(m, x_max)
-
-        diff_exp = tl.exp(m - maxs)
-
-        m_exp = tl.exp(m - maxs)
-
-        x_diff_exp = tl.exp(x - maxs[:, None])
-
-        x_diff_exp_masked = tl.where(mask, x_diff_exp, 0.0)
-
-        d_n = de * diff_exp + tl.sum(x_diff_exp_masked, axis=1)
-
-        if (BLOCK_N > 16) & (BLOCK_D > 16):
-            o_t = tl.dot(x_diff_exp_masked, v_tile)
-        else:
-            o_t = tl.sum(x_diff_exp_masked[:, :, None] * v_tile[None, :, :], axis=1)
-
-        o = o_t + o * m_exp[:, None]
-        m = maxs
-        de = d_n
-        block_k += BLOCK_N * h_dim
-        block_v += BLOCK_N * h_dim
-
-    o /= de[:, None] * scale
-    out_ptr = output + (n_ptr[:, None] * h_dim + d[None, :])
-
-    tl.store(out_ptr, o, mask=(n_ptr[:, None] < N) & mask_d)
+    tl.store(output + d, o, mask=maskd)
 
 
 @triton.jit
