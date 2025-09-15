@@ -6,23 +6,24 @@ import triton.language as tl
 
 
 @triton.jit
-def flash_attention_kernel_1d_in_graph(Q, K, V, output, pos_tensor, l, dim, seq_len, kv_mul, scale,
+def flash_attention_kernel_1d_in_graph(Q, K, V, output, pos_tensor, l, n_heads, head_dim, seq_len, kv_mul, scale,
                                        BLOCK_N: tl.constexpr,
                                        HEAD_DIM: tl.constexpr, num_warps=4):
     pid_h = tl.program_id(0)
     N = tl.load(pos_tensor) + 1
+    dim = head_dim * n_heads
     kv_dim = dim // kv_mul
 
     K = K + l * seq_len * kv_dim
     V = V + l * seq_len * kv_dim
 
     d = (pid_h * HEAD_DIM + tl.arange(0, HEAD_DIM))
-    d_qk = ((pid_h // kv_mul) * HEAD_DIM + tl.arange(0, HEAD_DIM))
+    d_kv = ((pid_h // kv_mul) * HEAD_DIM + tl.arange(0, HEAD_DIM))
 
     block_n = tl.arange(0, BLOCK_N)
     block_q = Q + d
-    block_k = K + (block_n[:, None] * kv_dim + d_qk[None, :])
-    block_v = V + (block_n[:, None] * kv_dim + d_qk[None, :])
+    block_k = K + (block_n[:, None] * kv_dim + d_kv[None, :])
+    block_v = V + (block_n[:, None] * kv_dim + d_kv[None, :])
 
     q_tile = tl.load(block_q) / scale
 
@@ -107,6 +108,55 @@ def flash_attention_kernel_1d_corner_in_graph(Q, K, V, output, pos_tensor, l, he
         de = d_n
         block_k += BLOCK_N * dim
         block_v += BLOCK_N * dim
+
+    o /= de
+    tl.store(output + d, o)
+
+
+@triton.jit
+def flash_attention_kernel_1d_kv_mul(Q, K, V, output, N, dim, kv_mul, scale, BLOCK_N: tl.constexpr,
+                                     HEAD_DIM: tl.constexpr, num_stages: tl.constexpr = 3):
+    pid_h = tl.program_id(0)
+    kv_dim = dim // kv_mul
+
+    d = (pid_h * HEAD_DIM * kv_mul + tl.arange(0, HEAD_DIM * kv_mul))
+    d_qk = (pid_h * HEAD_DIM + tl.arange(0, HEAD_DIM))
+
+    block_n = tl.arange(0, BLOCK_N)
+    block_q = Q + d
+    block_k = K + (block_n[:, None] * kv_dim + d_qk[None, :])
+    block_v = V + (block_n[:, None] * kv_dim + d_qk[None, :])
+
+    q_tile = tl.load(block_q) / scale
+
+    m = -float('inf')
+    de = 0.0
+    o = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    for n in tl.range(0, N, BLOCK_N, num_stages=num_stages):
+        mask = (block_n + n < N)
+        k_tile = tl.load(block_k, mask=mask[:, None], other=0.0)
+        v_tile = tl.load(block_v, mask=mask[:, None], other=0.0)
+        x = tl.sum(k_tile * q_tile, axis=1)
+
+        x_max_masked = tl.where(mask, x, float('-inf'))
+
+        x_max = tl.max(x_max_masked)
+
+        maxs = tl.maximum(m, x_max)
+
+        diff_exp = tl.exp(m - maxs)
+
+        x_diff_exp_masked = tl.where(mask, tl.exp(x - maxs), 0.0)
+        d_n = de * diff_exp + tl.sum(x_diff_exp_masked, dtype=tl.float32)
+
+        o_t = tl.sum(v_tile * x_diff_exp_masked[:, None], axis=0)
+
+        o = o_t + o * diff_exp
+        m = maxs
+        de = d_n
+        block_k += BLOCK_N * kv_dim
+        block_v += BLOCK_N * kv_dim
 
     o /= de
     tl.store(output + d, o)

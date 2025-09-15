@@ -1,7 +1,7 @@
 import torch
 
 from kernel.flash_attention import next_power_of_2, is_power_of_2, flash_attention_kernel_1d, \
-    flash_attention_kernel_1d_corner
+    flash_attention_kernel_1d_corner, flash_attention_kernel_1d_kv_mul
 from ops.softmax import softmax
 from ops.time_util import time_in_ms, store_time
 
@@ -20,6 +20,38 @@ def batch_mha(q, state, l, pos, n_heads, head_size, transformer_weights):
     state.atten_out[:] = out_heads.reshape(-1)
     to = time_in_ms()
     store_time('attention_bmm', to - tl)
+
+
+def flash_attention_kv_mul(q, state, l, pos, n_heads, head_size, kv_mul, transformer_weights):
+    t1 = time_in_ms()
+    BLOCK_N = min(next_power_of_2(pos + 1), 64)
+    q_heads = q.view(n_heads, head_size)  # [H, D]
+    K_heads = state.key_cache[l]  # [L, D]
+    V_heads = state.value_cache[l]  # [L, D]
+    dim = head_size * n_heads
+    n_kv_heads = n_heads // kv_mul
+
+    assert kv_mul > 0
+
+    if is_power_of_2(head_size):
+        grid = lambda META: (n_kv_heads,)
+
+        flash_attention_kernel_1d_kv_mul[grid](q_heads, K_heads,
+                                               V_heads,
+                                               state.atten_out, pos + 1, dim, kv_mul, transformer_weights.scale,
+                                               BLOCK_N=BLOCK_N,
+                                               HEAD_DIM=head_size)
+
+    else:
+        assert False
+        grid = lambda META: (n_heads,)
+        flash_attention_kernel_1d_corner[grid](q_heads, K_heads,
+                                               V_heads,
+                                               state.atten_out, pos + 1, dim, head_size, transformer_weights.scale,
+                                               BLOCK_N=BLOCK_N, HEAD_DIM=next_power_of_2(head_size)
+                                               )
+    te = time_in_ms()
+    store_time('attention_flash', te - t1)
 
 
 def flash_attention(q, state, l, pos, n_heads, head_size, kv_mul, transformer_weights):

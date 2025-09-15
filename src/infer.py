@@ -16,7 +16,7 @@ def generate(transformer, tokenizer, sampler, prompt: str, steps: int):
         transformer.prefill(prompt_tokens[:-1])
 
     token = prompt_tokens[-1]
-    pos = 0
+    pos = len(prompt_tokens) - 1
     while pos < steps:
         logits = transformer.forward(token, pos)  # logits tensor [vocab_size]
 

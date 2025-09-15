@@ -27,6 +27,7 @@ from src.sampler import Sampler
 from src.tokenizer import Tokenizer
 # from src.tokenizer import Tokenizer
 from src.transformer import Transformer
+from train import n_heads
 
 # ----------------------------------------------------------------------------
 
@@ -110,7 +111,7 @@ class Llama2Transformer(Transformer):
                         state.xb,
                         state.pos_tensor,
                         l,
-                        dim, config.seq_len, 1, transformer_weights.scale,
+                        n_heads, head_size, config.seq_len, 1, transformer_weights.scale,
                         BLOCK_N=BLOCK_N, HEAD_DIM=head_size
                     )
 

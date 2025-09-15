@@ -2,7 +2,8 @@ import torch
 import triton
 
 from kernel.matmul import matvec_kernel, matvec_kernel_in_graph_wo_p, matvec_kernel_in_graph_w_p, \
-    matmul_residual_kernel, matmul_residual_kernel_in_graph, matvec_kernel_bf16, matvec_kernel_f32
+    matmul_residual_kernel, matmul_residual_kernel_in_graph, matvec_kernel_bf16, matvec_kernel_f32, \
+    matvec_kernel_in_graph_wo_p_f32
 from ops.add import add
 from ops.time_util import time_in_ms, global_time_dict, store_time
 
@@ -47,7 +48,7 @@ def matmul_triton_float32(x, w, output=None):
     grid = lambda META: (triton.cdiv(w.shape[0], META['BLOCK_D']),)
 
     matvec_kernel_f32[grid](x, w, output,
-                          w.shape[0], w.shape[1], BLOCK_D=64, BLOCK_N=128, num_stages=3)
+                            w.shape[0], w.shape[1], BLOCK_D=64, BLOCK_N=128, num_stages=3)
 
     # print(f'shape x: {w.shape}, best_config: {matvec_kernel.best_config}')
     t2 = time_in_ms()
@@ -75,18 +76,20 @@ def matmul_triton_bfloat16(x, w, output=None):
     return output
 
 
-def matmul(x, w, output=None):
+def matmul(x, w, output=None, use_triton=True):
     """
     w: [d, n]
     x: [n]
     return: xout [d]
     """
-    if x.is_cuda and w.is_cuda:
+    if use_triton and x.is_cuda and w.is_cuda:
         return matmul_triton(x, w, output)
     t = time_in_ms()
+    if output is None:
+        output = torch.empty(w.shape[0], device=w.device, dtype=w.dtype)
     res = torch.mv(w, x, out=output)
     t2 = time_in_ms()
-    store_time('matmul_cpu', t2 - t)
+    store_time('matmul' + str(w.shape), t2 - t)
     return res
 
 
@@ -100,6 +103,15 @@ def matmul_in_graph(x, w, o, l, p=None):
     else:
         matvec_kernel_in_graph_w_p[grid](x, w, o, l, p,
                                          w.shape[1], w.shape[2], o.shape[1], o.shape[2])
+    t2 = time_in_ms()
+    store_time('matmul_triton', t2 - t)
+
+
+def matmul_in_graph_f32(x, w, o, l):
+    t = time_in_ms()
+    grid = lambda META: (triton.cdiv(w.shape[1], META['BLOCK_D']),)
+
+    matvec_kernel_in_graph_wo_p_f32[grid](x, w, o, l, w.shape[1], w.shape[2])
     t2 = time_in_ms()
     store_time('matmul_triton', t2 - t)
 

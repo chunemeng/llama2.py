@@ -34,6 +34,9 @@ class Config:
         self.rms_norm_eps = 1e-6
         self.head_dim = 0
         self.rope_range = 0
+        self.max_batch_size = 10
+        self.fnn_use_torch = False
+        self.use_matmul_triton = True
         self.rope_theta = 10000
 
     def from_params(self, dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len,
@@ -220,6 +223,7 @@ class RunState:
         self.pos_tensor = torch.tensor([0], dtype=torch.int32, device='cuda')
 
         # allocate buffers, initialized to zero (like calloc)
+        self.batch_x = torch.zeros(config.max_batch_size, dim, device=dev, dtype=type)
         self.x = torch.zeros(dim, device=dev, dtype=type)
         self.xb = torch.zeros(dim, device=dev, dtype=type)
         self.xb2 = torch.zeros(dim, device=dev, dtype=type)
